@@ -1,6 +1,8 @@
 use futures::future::{BoxFuture, FutureExt};
 use futures::prelude::*;
-use mio::{event::Source, net::TcpListener, net::TcpStream, Events, Interest, Token};
+use iou::IoUring;
+use mio::{event::Source, net::TcpListener, net::TcpStream};
+use nix::poll::PollFlags;
 use socket2::{Domain, Socket, Type};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -12,14 +14,14 @@ use std::task::{Context, Poll, Waker};
 use std::{env, thread};
 
 struct Poller {
-    poll: mio::Poll,
-    wait: HashMap<Token, Waker>,
+    ring: IoUring,
+    wait: HashMap<u64, Waker>,
 }
 
 thread_local! {
     static POLLER : RefCell<Poller> = {
         RefCell::new(Poller{
-            poll: mio::Poll::new().unwrap(),
+            ring: IoUring::new(4096).unwrap(),
             wait: HashMap::new(),
         })
     };
@@ -51,7 +53,6 @@ where
             core_affinity::set_for_current(core_affinity::CoreId { id: i });
             spawn(r);
 
-            let mut events = Events::with_capacity(1024);
             loop {
                 let mut ready = VecDeque::new();
                 RUNNABLE.with(|runnable| {
@@ -62,14 +63,15 @@ where
                     let future = t.future.borrow_mut();
                     let w = waker(t.clone());
                     let mut context = Context::from_waker(&w);
-                    if let Poll::Pending = Pin::new(future).as_mut().poll(&mut context) {}
+                    let _ = Pin::new(future).as_mut().poll(&mut context);
                 }
 
                 POLLER.with(|poller| {
                     let mut p = poller.borrow_mut();
-                    p.poll.poll(&mut events, None).unwrap();
-                    for e in events.into_iter() {
-                        if let Some(w) = p.wait.remove(&e.token()) {
+                    let _ = p.ring.wait_for_cqes(1);
+
+                    while let Some(cqe) = p.ring.peek_for_cqe() {
+                        if let Some(w) = p.wait.remove(&cqe.user_data()) {
                             w.wake();
                         }
                     }
@@ -108,15 +110,6 @@ pub struct Async<T: Source> {
     io: Box<T>,
 }
 
-impl<T: Source> Drop for Async<T> {
-    fn drop(&mut self) {
-        POLLER.with(|poller| {
-            let poller = poller.borrow_mut();
-            poller.poll.registry().deregister(&mut self.io).unwrap();
-        });
-    }
-}
-
 impl Async<TcpListener> {
     pub fn new(addr: SocketAddr) -> Self {
         let sock = Socket::new(Domain::ipv6(), Type::stream(), None).unwrap();
@@ -126,17 +119,7 @@ impl Async<TcpListener> {
         sock.bind(&addr.into()).unwrap();
         sock.listen(1024).unwrap();
 
-        let mut listener = TcpListener::from_std(sock.into_tcp_listener());
-        let token = Token(listener.as_raw_fd() as usize);
-
-        POLLER.with(|poller| {
-            let poller = poller.borrow_mut();
-            poller
-                .poll
-                .registry()
-                .register(&mut listener, token, Interest::READABLE)
-                .unwrap();
-        });
+        let listener = TcpListener::from_std(sock.into_tcp_listener());
         Async {
             io: Box::new(listener),
         }
@@ -147,11 +130,24 @@ impl Stream for Async<TcpListener> {
     type Item = std::io::Result<Async<TcpStream>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let token = Token(self.as_ref().io.as_raw_fd() as usize);
+        let token = self.as_ref().io.as_raw_fd() as u64;
         match self.io.accept() {
             Ok(stream) => Poll::Ready(Some(Ok(Async::<TcpStream>::new(stream.0)))),
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                POLLER.with(|poller| poller.borrow_mut().wait.insert(token, cx.waker().clone()));
+                POLLER.with(|poller| {
+                    let mut poller = poller.borrow_mut();
+                    poller.wait.insert(token, cx.waker().clone());
+                    let mut q = poller.ring.prepare_sqe().unwrap();
+                    unsafe {
+                        uring_sys::io_uring_prep_poll_add(
+                            q.raw_mut(),
+                            token as i32,
+                            PollFlags::POLLIN.bits(),
+                        );
+                        q.set_user_data(token);
+                    }
+                    let _ = poller.ring.submit_sqes();
+                });
                 std::task::Poll::Pending
             }
             Err(e) => std::task::Poll::Ready(Some(Err(e))),
@@ -166,11 +162,24 @@ impl<'a> Future for ReadFuture<'a> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = &mut *self;
-        let token = Token(me.0.io.as_raw_fd() as usize);
+        let token = me.0.io.as_raw_fd() as u64;
         match me.0.io.read(&mut me.1) {
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                POLLER.with(|poller| poller.borrow_mut().wait.insert(token, cx.waker().clone()));
-                Poll::Pending
+                POLLER.with(|poller| {
+                    let mut poller = poller.borrow_mut();
+                    poller.wait.insert(token, cx.waker().clone());
+                    let mut q = poller.ring.prepare_sqe().unwrap();
+                    unsafe {
+                        uring_sys::io_uring_prep_poll_add(
+                            q.raw_mut(),
+                            token as i32,
+                            PollFlags::POLLIN.bits(),
+                        );
+                        q.set_user_data(token);
+                    }
+                    let _ = poller.ring.submit_sqes();
+                });
+                std::task::Poll::Pending
             }
             x => Poll::Ready(x),
         }
@@ -184,10 +193,23 @@ impl<'a> Future for WriteFuture<'a> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = &mut *self;
-        let token = Token(me.0.io.as_raw_fd() as usize);
+        let token = me.0.io.as_raw_fd() as u64;
         match me.0.io.write(me.1) {
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                POLLER.with(|poller| poller.borrow_mut().wait.insert(token, cx.waker().clone()));
+                POLLER.with(|poller| {
+                    let mut poller = poller.borrow_mut();
+                    poller.wait.insert(token, cx.waker().clone());
+                    let mut q = poller.ring.prepare_sqe().unwrap();
+                    unsafe {
+                        uring_sys::io_uring_prep_poll_add(
+                            q.raw_mut(),
+                            token as i32,
+                            PollFlags::POLLOUT.bits(),
+                        );
+                        q.set_user_data(token);
+                    }
+                    let _ = poller.ring.submit_sqes();
+                });
                 Poll::Pending
             }
             x => Poll::Ready(x),
@@ -196,7 +218,7 @@ impl<'a> Future for WriteFuture<'a> {
 }
 
 impl Async<TcpStream> {
-    pub fn new(mut io: TcpStream) -> Self {
+    pub fn new(io: TcpStream) -> Self {
         io.set_nodelay(true).unwrap();
         let raw_fd = io.as_raw_fd();
         let flags =
@@ -205,15 +227,6 @@ impl Async<TcpStream> {
                 | nix::fcntl::OFlag::O_NONBLOCK;
         nix::fcntl::fcntl(raw_fd, nix::fcntl::F_SETFL(flags)).unwrap();
 
-        POLLER.with(|poller| {
-            let token = Token(raw_fd as usize);
-            let poller = poller.borrow_mut();
-            poller
-                .poll
-                .registry()
-                .register(&mut io, token, Interest::READABLE | Interest::WRITABLE)
-                .unwrap();
-        });
         Async { io: Box::new(io) }
     }
 
@@ -226,7 +239,7 @@ impl Async<TcpStream> {
     }
 }
 
-// strolen from the future code
+// stolen from the future code
 use std::mem::{self, ManuallyDrop};
 use std::rc::Rc;
 use std::task::{RawWaker, RawWakerVTable};
